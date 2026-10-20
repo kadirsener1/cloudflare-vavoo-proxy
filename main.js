@@ -96,6 +96,7 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
 '2228088973f56fff74c71f', //85 SPOR SMART 2
 '2726496671ea6fd3c6dc54', //86 SPOR SMART 2 HD
 '361703541447c2d8cea904', //87 BEİN GURME
+'178850393550c13d869fbf', // 88 YABAN TV
     
     // 'buraya_yeni_kanal_id_ekle',
 ];
