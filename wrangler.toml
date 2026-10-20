@@ -1,0 +1,7 @@
+name = "vavoo-stream-extractor"
+main = "src/index.js"              # Kodunun gerçek yolu neyse onu yaz
+compatibility_date = "2024-01-01"
+
+[[r2_buckets]]
+binding = "VAVOO_BUCKET"
+bucket_name = "vavoo-stream-cache"
