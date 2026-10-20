@@ -1,7 +1,7 @@
 /**
  * Cloudflare Worker for Vavoo Stream Extraction
  * Repo: cloudflare-vavoo-proxy
- * Version: 2.3 (Fixed 403: vavoo.tv API + Referer/Origin + HTTPS + Cache API)
+ * Version: 2.4 (Robust JSON parsing + auth fallback + resolve fix)
  */
 
 const CORS_HEADERS = {
@@ -12,8 +12,17 @@ const CORS_HEADERS = {
   'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Location',
 };
 
-// Segmentlerin edge cache'de kalma süresi (saniye)
 const SEGMENT_CACHE_TTL = 3600;
+
+// Auth API için denenecek endpoint'ler (sırayla)
+const AUTH_ENDPOINTS = [
+  'https://www.vavoo.tv/api/app/ping',
+  'https://www.lokke.app/api/app/ping',
+  'https://vavoo.to/api/app/ping',
+];
+
+// Resolve endpoint (tek, sabit)
+const RESOLVE_ENDPOINT = 'https://vavoo.to/mediahubmx-resolve.json';
 
 function getClientIP(request) {
   try {
@@ -31,6 +40,20 @@ class ExtractorError extends Error {
   constructor(message) {
       super(message);
       this.name = 'ExtractorError';
+  }
+}
+
+// --- Güvenli JSON parse ---
+async function safeJson(response, context) {
+  const text = await response.text();
+  if (!text || text.trim() === '') {
+      throw new ExtractorError(`${context}: Empty response body (status ${response.status})`);
+  }
+  try {
+      return JSON.parse(text);
+  } catch (e) {
+      const preview = text.substring(0, 300).replace(/\s+/g, ' ');
+      throw new ExtractorError(`${context}: Invalid JSON (status ${response.status}): ${preview}`);
   }
 }
 
@@ -105,15 +128,34 @@ class VavooExtractor {
           "X-Forwarded-For": clientIP,
           "X-Real-IP": clientIP,
       };
-      // ✅ DÜZELTME 1: API adresi vavoo.tv olarak güncellendi
-      const response = await fetch("https://www.vavoo.tv/api/app/ping", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify(authPayload)
-      });
-      if (!response.ok) throw new ExtractorError(`Vavoo Auth API failed: ${response.status}`);
-      const result = await response.json();
-      if (!result.addonSig) throw new ExtractorError('Vavoo auth response missing addonSig.');
+
+      let lastError = null;
+      let result = null;
+
+      for (const endpoint of AUTH_ENDPOINTS) {
+          try {
+              const response = await fetch(endpoint, {
+                  method: "POST",
+                  headers: authHeaders,
+                  body: JSON.stringify(authPayload)
+              });
+              if (!response.ok) {
+                  lastError = new ExtractorError(`Auth ${endpoint} failed: ${response.status}`);
+                  continue;
+              }
+              result = await safeJson(response, `Auth ${endpoint}`);
+              if (result && result.addonSig) break;
+              lastError = new ExtractorError(`Auth ${endpoint} missing addonSig`);
+              result = null;
+          } catch (e) {
+              lastError = e;
+              console.error(`Auth attempt failed (${endpoint}): ${e.message}`);
+          }
+      }
+
+      if (!result || !result.addonSig) {
+          throw lastError || new ExtractorError('All auth endpoints failed.');
+      }
 
       let addonSig = result.addonSig;
       try {
@@ -144,14 +186,17 @@ class VavooExtractor {
           "X-Forwarded-For": clientIP,
           "X-Real-IP": clientIP,
       };
-      // ✅ DÜZELTME 2: Resolve endpoint'i de vavoo.tv'ye taşındı (çalışmazsa vavoo.to'ya geri dönülebilir)
-      const response = await fetch("https://www.vavoo.tv/mediahubmx-resolve.json", {
+      const response = await fetch(RESOLVE_ENDPOINT, {
           method: "POST",
           headers: resolveHeaders,
           body: JSON.stringify(resolvePayload)
       });
-      if (!response.ok) throw new ExtractorError(`Vavoo Resolve API failed: ${response.status}`);
-      const result = await response.json();
+      if (!response.ok) {
+          const errText = await response.text().catch(() => '');
+          throw new ExtractorError(`Vavoo Resolve API failed: ${response.status} ${errText.substring(0, 200)}`);
+      }
+      const result = await safeJson(response, 'Vavoo Resolve');
+
       let streamUrl;
       if (Array.isArray(result)) {
           const httpsStream = result.find(item => item.url && item.url.startsWith('https://'));
@@ -171,11 +216,7 @@ class VavooExtractor {
       return this.proxyStream(streamUrl, request, env, ctx);
   }
 
-  // --- Cache API Tabanlı Proxy (403 Düzeltmeleri Dahil) ---
   async proxyStream(streamUrl, request, env, ctx) {
-      // ✅ DÜZELTME 3: HTTP -> HTTPS zorlaması
-      // Not: Bazı Vavoo stream sunucuları HTTPS desteklemez, bu yüzden
-      // sadece deneme amaçlıdır; başarısız olursa orijinal HTTP kullanılır.
       const originalStreamUrl = streamUrl;
       if (streamUrl.startsWith('http://')) {
           streamUrl = streamUrl.replace('http://', 'https://');
@@ -192,7 +233,6 @@ class VavooExtractor {
       const cache = caches.default;
       const cacheKey = new Request(streamUrl, { method: 'GET' });
 
-      // 1) Sadece Range'siz isteklerde cache'e bak
       if (!rangeHeader && !isM3U8) {
           const cached = await cache.match(cacheKey);
           if (cached) {
@@ -202,9 +242,7 @@ class VavooExtractor {
           }
       }
 
-      // 2) Upstream'den çek
       const fetchHeaders = new Headers();
-      // ✅ DÜZELTME 4: Vavoo stream sunucularının beklediği başlıklar
       fetchHeaders.set('User-Agent', 'okhttp/4.11.0');
       fetchHeaders.set('Accept', '*/*');
       fetchHeaders.set('Accept-Encoding', 'identity');
@@ -219,7 +257,6 @@ class VavooExtractor {
           redirect: 'follow',
       });
 
-      // ✅ DÜZELTME 5: HTTPS denemesi başarısız olursa orijinal HTTP URL'ye geri dön
       if (!originResponse.ok && originResponse.status === 403 && streamUrl !== originalStreamUrl) {
           const fallbackHeaders = new Headers(fetchHeaders);
           fallbackHeaders.set('Referer', 'http://vavoo.to/');
@@ -241,7 +278,6 @@ class VavooExtractor {
       const contentType = (originResponse.headers.get('content-type') || '').toLowerCase();
       const isM3U8Response = isM3U8 || contentType.includes('mpegurl') || contentType.includes('m3u8');
 
-      // 3) m3u8: içeriği yeniden yaz, cache'leme (canlı yayın sürekli değişir)
       if (isM3U8Response) {
           const text = await originResponse.text();
           const workerOrigin = new URL(request.url).origin;
@@ -257,7 +293,6 @@ class VavooExtractor {
           });
       }
 
-      // 4) Segment: istemciye dön + (Range'siz ve 200 ise) cache'e yaz
       const newHeaders = new Headers();
       for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
           if (originResponse.headers.has(h)) newHeaders.set(h, originResponse.headers.get(h));
@@ -270,7 +305,6 @@ class VavooExtractor {
           headers: newHeaders,
       });
 
-      // Sadece Range'siz, tam (200) yanıtları cache'e al
       if (!rangeHeader && originResponse.status === 200) {
           ctx.waitUntil(
               cache.put(cacheKey, clientResponse.clone()).catch(() => {})
@@ -387,7 +421,7 @@ function handleInfoPage(request) {
   <div class="container">
       <header class="header">
           <h1>?? Vavoo Stream Extractor</h1>
-          <div class="version-badge"><span>v2.3</span><span class="status-badge">ONLINE</span></div>
+          <div class="version-badge"><span>v2.4</span><span class="status-badge">ONLINE</span></div>
           <p class="description">Estrazione stream Vavoo con proxy integrato, cache edge tramite Cache API e bassa latenza.</p>
       </header>
       <div class="cards-grid">
@@ -418,7 +452,7 @@ function handleStatus(request) {
   const clientIP = getClientIP(request);
   const statusInfo = {
       status: "operational",
-      version: "2.3",
+      version: "2.4",
       repo: "cloudflare-vavoo-proxy",
       timestamp: new Date().toISOString(),
       client_info: { ip: clientIP, country: request.headers.get('CF-IPCountry') || 'unknown', user_agent: request.headers.get('User-Agent') || 'unknown', is_ipv6: clientIP.includes(':') },
