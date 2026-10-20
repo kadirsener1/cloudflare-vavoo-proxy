@@ -11,6 +11,7 @@ const { URL } = require('url');
 const DEFAULT_ALLOWED_CHANNEL_IDS = [
     '22330664333ebb4acbb6ab',
     '3828793616b62b9cc5834c',
+    '159609588253825d67ec56',
     // 'buraya_yeni_kanal_id_ekle',
 ];
 
