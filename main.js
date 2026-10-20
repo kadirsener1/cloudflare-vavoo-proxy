@@ -98,12 +98,14 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
    //ULUSAL
    '4559304258567c5d6cd2a', //atv hd
    '129909794290450d5e2d1', //atv fhd
+   '161305206673e7c4b7739', //NOW HD
    //BELGESEL
 '361703541447c2d8cea904', //87 BEİN GURME
 '178850393550c13d869fbf', // 88 YABAN TV
 '1165670263945583e36e19', //viasat history
 '17854799144cbb1c340ac1', // special box belgesel
 '3856957052050da882aa10', // tarih tv
+'1960546091bcaf052d3800', //nat geo
    //ÇOCUK
    '11743931b356e8661a4d', // Cartonito
    '2046583925cdbd476d8733', //Anigo Zorex
