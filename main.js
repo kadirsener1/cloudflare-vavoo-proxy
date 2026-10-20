@@ -97,6 +97,12 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
 '2726496671ea6fd3c6dc54', //86 SPOR SMART 2 HD
 '361703541447c2d8cea904', //87 BEİN GURME
 '178850393550c13d869fbf', // 88 YABAN TV
+   '11743931b356e8661a4d', // Cartonito
+   '2046583925cdbd476d8733', //Anigo Zorex
+   '1165670263945583e36e19', //viasat history
+   '17854799144cbb1c340ac1', // special box belgesel
+   '3856957052050da882aa10', // tarih tv
+   
     
     // 'buraya_yeni_kanal_id_ekle',
 ];
