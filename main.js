@@ -25,6 +25,9 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
 '1536730627bbf8f95ca477',
 '1453692314f52730c50395',
 '143239535a2e3c23c1d1',
+    '267105889a25a483e5e80',
+    '1536730627bbf8f95ca477'
+    
     // 'buraya_yeni_kanal_id_ekle',
 ];
 
