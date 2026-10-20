@@ -1,7 +1,7 @@
 /**
  * Cloudflare Worker for Vavoo Stream Extraction
  * Repo: cloudflare-vavoo-proxy
- * Version: 2.0 (R2 Persistent Cache + Low Latency + IPv4 Fallback)
+ * Version: 2.1 (Cache API + Low Latency + IPv4 Fallback)
  */
 
 const CORS_HEADERS = {
@@ -12,8 +12,8 @@ const CORS_HEADERS = {
   'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Location',
 };
 
-const MANIFEST_MAX_AGE_SEC = 3;
-const SEGMENT_MAX_AGE_SEC = 3600;
+// Segmentlerin edge cache'de kalma süresi (saniye)
+const SEGMENT_CACHE_TTL = 3600;
 
 function getClientIP(request) {
   try {
@@ -27,13 +27,6 @@ function getClientIP(request) {
       '127.0.0.1';
 }
 
-async function hashUrl(url) {
-  const msgUint8 = new TextEncoder().encode(url);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
 class ExtractorError extends Error {
   constructor(message) {
       super(message);
@@ -41,6 +34,7 @@ class ExtractorError extends Error {
   }
 }
 
+// --- m3u8 URL Rewrite ---
 function rewritePlaylist(text, baseUrl, workerOrigin) {
   const base = new URL(baseUrl);
   const proxyPrefix = `${workerOrigin}/proxy-segment?url=`;
@@ -175,12 +169,7 @@ class VavooExtractor {
       return this.proxyStream(streamUrl, request, env, ctx);
   }
 
-  withCors(response) {
-      const newHeaders = new Headers(response.headers);
-      Object.entries(CORS_HEADERS).forEach(([k, v]) => newHeaders.set(k, v));
-      return new Response(response.body, { status: response.status, headers: newHeaders });
-  }
-
+  // --- Cache API Tabanlı Proxy ---
   async proxyStream(streamUrl, request, env, ctx) {
       if (!/^https?:\/\//i.test(streamUrl)) {
           return new Response(JSON.stringify({ error: 'Invalid upstream URL scheme.' }), {
@@ -189,30 +178,26 @@ class VavooExtractor {
       }
 
       const isM3U8 = /m3u8/i.test(streamUrl);
-      const urlHash = await hashUrl(streamUrl);
-      const r2Key = `vavoo/${urlHash}.${isM3U8 ? 'm3u8' : 'ts'}`;
+      const rangeHeader = request.headers.get('Range');
+      const cache = caches.default;
+      const cacheKey = new Request(streamUrl, { method: 'GET' });
 
-      const r2Object = await env.VAVOO_BUCKET.get(r2Key);
-      if (r2Object) {
-          const ageSeconds = (Date.now() - r2Object.uploaded.getTime()) / 1000;
-          const maxAge = isM3U8 ? MANIFEST_MAX_AGE_SEC : SEGMENT_MAX_AGE_SEC;
-          if (!isM3U8 || ageSeconds < maxAge) {
-              const headers = new Headers();
-              r2Object.writeHttpMetadata(headers);
-              headers.set('etag', r2Object.httpEtag);
-              headers.set('Cache-Control', isM3U8 ? 'no-store' : 'public, max-age=3600');
+      // 1) Sadece Range'siz isteklerde cache'e bak
+      //    (Range'li isteklerde cache'deki 200 yanıtı yanlış olur)
+      if (!rangeHeader && !isM3U8) {
+          const cached = await cache.match(cacheKey);
+          if (cached) {
+              const headers = new Headers(cached.headers);
               Object.entries(CORS_HEADERS).forEach(([k, v]) => headers.set(k, v));
-              return new Response(r2Object.body, { status: 200, headers });
+              return new Response(cached.body, { status: cached.status, headers });
           }
       }
 
+      // 2) Upstream'den çek
       const fetchHeaders = new Headers();
       fetchHeaders.set('User-Agent', 'MediaHubMX/2');
       fetchHeaders.set('Accept', '*/*');
-      if (!isM3U8) {
-          const range = request.headers.get('Range');
-          if (range) fetchHeaders.set('Range', range);
-      }
+      if (rangeHeader) fetchHeaders.set('Range', rangeHeader);
 
       const originResponse = await fetch(streamUrl, {
           method: 'GET',
@@ -230,16 +215,11 @@ class VavooExtractor {
       const contentType = (originResponse.headers.get('content-type') || '').toLowerCase();
       const isM3U8Response = isM3U8 || contentType.includes('mpegurl') || contentType.includes('m3u8');
 
+      // 3) m3u8: içeriği yeniden yaz, cache'leme (canlı yayın sürekli değişir)
       if (isM3U8Response) {
           const text = await originResponse.text();
           const workerOrigin = new URL(request.url).origin;
           const rewritten = rewritePlaylist(text, streamUrl, workerOrigin);
-
-          ctx.waitUntil(
-              env.VAVOO_BUCKET.put(r2Key, rewritten, {
-                  httpMetadata: { contentType: 'application/vnd.apple.mpegurl' },
-              }).catch(() => {})
-          );
 
           return new Response(rewritten, {
               status: 200,
@@ -251,30 +231,32 @@ class VavooExtractor {
           });
       }
 
-      const segmentBody = await originResponse.arrayBuffer();
+      // 4) Segment: istemciye dön + (Range'siz ve 200 ise) cache'e yaz
       const newHeaders = new Headers();
       for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
           if (originResponse.headers.has(h)) newHeaders.set(h, originResponse.headers.get(h));
       }
       Object.entries(CORS_HEADERS).forEach(([k, v]) => newHeaders.set(k, v));
+      newHeaders.set('Cache-Control', `public, max-age=${SEGMENT_CACHE_TTL}`);
 
-      const response = new Response(segmentBody, {
+      const clientResponse = new Response(originResponse.body, {
           status: originResponse.status,
           headers: newHeaders,
       });
 
-      if (originResponse.status === 200) {
+      // Sadece Range'siz, tam (200) yanıtları cache'e al
+      // 206 (Partial Content) cache.put ile uyumsuzdur, atlanır
+      if (!rangeHeader && originResponse.status === 200) {
           ctx.waitUntil(
-              env.VAVOO_BUCKET.put(r2Key, segmentBody, {
-                  httpMetadata: { contentType: originResponse.headers.get('content-type') || 'video/mp2t' },
-              }).catch(() => {})
+              cache.put(cacheKey, clientResponse.clone()).catch(() => {})
           );
       }
 
-      return response;
+      return clientResponse;
   }
 }
 
+// --- M3U Playlist Proxy ---
 async function handlePlaylistProxy(request) {
   const url = new URL(request.url);
   const m3uUrlsParam = url.searchParams.get('url');
@@ -347,6 +329,7 @@ function rewritePlaylistUrls(m3uContent, workerDomain) {
   return processedM3uParts.join('\n');
 }
 
+// --- Info & Status Pages ---
 function handleInfoPage(request) {
   const workerDomain = new URL(request.url).origin;
   const htmlContent = `<!DOCTYPE html>
@@ -379,13 +362,13 @@ function handleInfoPage(request) {
   <div class="container">
       <header class="header">
           <h1>?? Vavoo Stream Extractor</h1>
-          <div class="version-badge"><span>v2.0</span><span class="status-badge">ONLINE</span></div>
-          <p class="description">Estrazione stream Vavoo con proxy integrato, cache persistente su R2 e bassa latenza.</p>
+          <div class="version-badge"><span>v2.1</span><span class="status-badge">ONLINE</span></div>
+          <p class="description">Estrazione stream Vavoo con proxy integrato, cache edge tramite Cache API e bassa latenza.</p>
       </header>
       <div class="cards-grid">
           <div class="card">
               <h3 class="card-title">Estrazione Stream</h3>
-              <p class="card-description">Fornisci un URL Vavoo per ottenere uno stream proxato con cache R2 persistente.<br><span class="warning">?? Nota:</span> Se gli stream non partono, disattiva IPv6 sulla tua connessione.</p>
+              <p class="card-description">Fornisci un URL Vavoo per ottenere uno stream proxato con cache edge integrata.<br><span class="warning">?? Nota:</span> Se gli stream non partono, disattiva IPv6 sulla tua connessione.</p>
               <div class="endpoint-code">${workerDomain}/manifest.m3u8?url=&lt;VAVOO_URL&gt;</div>
           </div>
           <div class="card">
@@ -410,11 +393,11 @@ function handleStatus(request) {
   const clientIP = getClientIP(request);
   const statusInfo = {
       status: "operational",
-      version: "2.0",
+      version: "2.1",
       repo: "cloudflare-vavoo-proxy",
       timestamp: new Date().toISOString(),
       client_info: { ip: clientIP, country: request.headers.get('CF-IPCountry') || 'unknown', user_agent: request.headers.get('User-Agent') || 'unknown', is_ipv6: clientIP.includes(':') },
-      supported_services: { vavoo: { mode: "proxy-cache-r2", path: "/manifest.m3u8?url=https://vavoo.to/..." } },
+      supported_services: { vavoo: { mode: "proxy-cache-api", path: "/manifest.m3u8?url=https://vavoo.to/..." } },
       endpoints: { info: new URL(request.url).origin + '/', status: new URL(request.url).origin + '/status', playlist_proxy: new URL(request.url).origin + '/playlist?url=<m3u_url>' }
   };
   return new Response(JSON.stringify(statusInfo, null, 2), { headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
@@ -439,6 +422,7 @@ export default {
               return await handlePlaylistProxy(request);
           }
 
+          // Segment / varyant playlist proxy rotası
           if (url.pathname === '/proxy-segment') {
               const segmentUrl = url.searchParams.get('url');
               if (!segmentUrl) {
