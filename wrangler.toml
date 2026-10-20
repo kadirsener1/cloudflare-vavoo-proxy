@@ -2,10 +2,11 @@ name = "cloudflare-vavoo-proxy"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
+# Cloudflare gözlemlenebilirlik (log ve metrikler için)
 [observability]
 enabled = true
 head_sampling_rate = 1
 
+# Akıllı yerleşim: Worker, isteğe en yakın veri merkezinde çalışır
 [placement]
-mode = "region"
-region = "eu-central"
+mode = "smart"
