@@ -2,11 +2,6 @@ name = "cloudflare-vavoo-proxy"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
-# R2 Bucket Binding
-# Cloudflare panelinde R2 > Create bucket ile "vavoo-stream-cache" oluştur
-[[r2_buckets]]
-binding = "VAVOO_BUCKET"
-bucket_name = "vavoo-stream-cache"
 
 # Opsiyonel: Worker'ın çalışacağı uyumluluk ayarları
 [observability]
