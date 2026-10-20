@@ -1,13 +1,26 @@
 /**
  * Deno Deploy - Vavoo Stream Extractor
- * Version: 1.3-deno
- * Uyarlama: Cloudflare Workers -> Deno Deploy
+ * Version: 1.4 - Deno Deploy uyumlu, build hatası giderilmiş
+ *
+ * Özellikler:
+ * - Vavoo stream çıkarma (302 redirect)
+ * - M3U playlist proxy
+ * - Auth & stream cache (15 dk) + single-flight
+ * - Stale fallback (30 dk)
+ * - Kanal whitelist (sadece izin verilen ID'ler)
+ * - IPv6 engeli
  */
 
 // ============================================================
 //  İZİN VERİLEN KANALLAR (WHITELIST)
 // ============================================================
-const DEFAULT_ALLOWED_CHANNEL_IDS = [
+// Örnek: https://vavoo.to/vavoo-iptv/play/22330664333ebb4acbb6ab
+//                                           ^^^^^^^^^^^^^^^^^^^
+//                                           bu kısmı ekle
+//
+// Ortam değişkeni ALLOWED_CHANNEL_IDS = "id1,id2" tanımlarsan
+// bu liste ezilir.
+const DEFAULT_ALLOWED_CHANNEL_IDS: string[] = [
     '22330664333ebb4acbb6ab',
     // 'buraya_yeni_kanal_id_ekle',
 ];
@@ -16,7 +29,7 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
 //  Sabitler
 // ============================================================
 
-const CORS_HEADERS = {
+const CORS_HEADERS: Record<string, string> = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
     'Access-Control-Allow-Headers': 'Content-Type, Range, User-Agent, Accept, Authorization, X-Requested-With',
@@ -44,7 +57,7 @@ function getClientIP(request: Request): string {
         const url = new URL(request.url);
         const explicitIp = url.searchParams.get('ip');
         if (explicitIp && explicitIp.trim()) return explicitIp.trim();
-    } catch {}
+    } catch { /* ignore */ }
     return request.headers.get('CF-Connecting-IP') ||
         request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
         request.headers.get('X-Real-IP') ||
@@ -60,7 +73,7 @@ class ExtractorError extends Error {
     }
 }
 
-// --- Whitelist (Deno Deploy ortam değişkeni) ---
+// --- Whitelist ---
 
 function getAllowedChannelIds(): Set<string> {
     const envVal = Deno.env.get('ALLOWED_CHANNEL_IDS');
@@ -232,7 +245,7 @@ class VavooExtractor {
             },
             iap: { supported: true }
         };
-        const authHeaders = {
+        const authHeaders: Record<string, string> = {
             "user-agent": "okhttp/4.11.0",
             "accept": "application/json",
             "content-type": "application/json; charset=utf-8",
@@ -265,7 +278,7 @@ class VavooExtractor {
                     addonSig = btoa(JSON.stringify(sigObj));
                 }
             }
-        } catch (_e) { /* rewrite başarısız → orijinali kullan */ }
+        } catch { /* rewrite başarısız → orijinali kullan */ }
 
         authCache.set(clientIP, addonSig);
         return addonSig;
@@ -293,7 +306,7 @@ class VavooExtractor {
             return streamUrl;
         } catch (err: any) {
             if (err.status === 401 || err.status === 403) {
-                console.warn(`Auth expired for ${clientIP}, refreshing and retrying...`);
+                console.warn(`Auth expired for ${clientIP}, refreshing...`);
                 authCache.delete(clientIP);
                 try {
                     const newSig = await this.getAuthSignature(clientIP);
@@ -321,7 +334,7 @@ class VavooExtractor {
         const resolvePayload = {
             language: "de", region: "AT", url: vavooUrl, clientVersion: "3.0.2"
         };
-        const resolveHeaders = {
+        const resolveHeaders: Record<string, string> = {
             "user-agent": "MediaHubMX/2",
             "accept": "application/json",
             "content-type": "application/json; charset=utf-8",
@@ -406,7 +419,6 @@ async function handlePlaylistProxy(request: Request, allowedSet: Set<string>): P
 
     const fetchPromises = m3uUrls.map(async (m3uUrl: string) => {
         try {
-            // Deno Deploy'da 'cf' yok; edge cache için Cache-Control başlığı kullanıyoruz.
             const response = await fetchWithTimeout(m3uUrl, {
                 headers: { 'User-Agent': 'Mozilla/5.0' },
             }, PLAYLIST_TIMEOUT_MS);
@@ -503,7 +515,7 @@ function handleInfoPage(request: Request): Response {
   <div class="container">
       <header class="header">
           <h1>Vavoo Stream Extractor</h1>
-          <div class="version-badge"><span>v1.3-deno</span><span class="status-badge">ONLINE</span></div>
+          <div class="version-badge"><span>v1.4</span><span class="status-badge">ONLINE</span></div>
           <p class="description">Anti-freeze optimizasyonlu Vavoo stream extractor (Deno Deploy).</p>
       </header>
       <div class="cards-grid">
@@ -534,7 +546,7 @@ function handleStatus(request: Request, allowedSet: Set<string>): Response {
     const clientIP = getClientIP(request);
     const statusInfo = {
         status: "operational",
-        version: "1.3-deno",
+        version: "1.4",
         timestamp: new Date().toISOString(),
         client_info: {
             ip: clientIP,
