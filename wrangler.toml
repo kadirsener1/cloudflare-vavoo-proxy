@@ -2,8 +2,6 @@ name = "cloudflare-vavoo-proxy"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
-
-# Opsiyonel: Worker'ın çalışacağı uyumluluk ayarları
 [observability]
 enabled = true
 head_sampling_rate = 1
