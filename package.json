@@ -1,16 +1,14 @@
 {
   "name": "cloudflare-vavoo-proxy",
-  "version": "2.0.0",
-  "description": "Cloudflare Worker proxy for Vavoo streams with R2 persistent cache, low-latency HLS and IPv4 fallback",
+  "version": "2.1.0",
+  "description": "Cloudflare Worker proxy for Vavoo streams with Cache API edge caching, low-latency HLS and IPv4 fallback",
   "private": true,
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail",
-    "r2:list": "wrangler r2 object list vavoo-stream-cache",
-    "r2:clean": "wrangler r2 object delete vavoo-stream-cache --recursive"
+    "tail": "wrangler tail"
   },
   "devDependencies": {
     "wrangler": "^3.90.0"
@@ -22,7 +20,7 @@
     "cloudflare-worker",
     "vavoo",
     "hls",
-    "r2",
+    "cache-api",
     "proxy"
   ],
   "repository": {
