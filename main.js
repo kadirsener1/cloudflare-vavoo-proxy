@@ -112,6 +112,7 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
 '17854799144cbb1c340ac1', // special box belgesel
 '3856957052050da882aa10', // tarih tv
 '1960546091bcaf052d3800', //nat geo
+'1519237116daf8e783a22b', //NAT WİLD
    //ÇOCUK
    '11743931b356e8661a4d', // Cartonito
    '2046583925cdbd476d8733', //Anigo Zorex
