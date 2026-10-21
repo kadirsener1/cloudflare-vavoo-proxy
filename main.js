@@ -113,6 +113,7 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
    //ÇOCUK
    '11743931b356e8661a4d', // Cartonito
    '2046583925cdbd476d8733', //Anigo Zorex
+   '7274274379cbbe0c37b06', //REDBOX ANİMASYON 1
 ];
 
 // BİR KEZ HESAPLA — her istekte env okumaya gerek yok
