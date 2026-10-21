@@ -1,13 +1,15 @@
 /**
  * Node.js uyarlaması - Render.com için
- * HLS proxy + token yenileme + anti-freeze
+ * AKILLI YÖNLENDİRME MİMARİSİ (302 Redirect + Token Refresh)
+ * 
+ * Video trafiği Render'dan GEÇMEZ → bant genişliği kotası korunur
+ * Render sadece yönlendirme ve token dağıtım istasyonu olarak çalışır
  */
 const http = require('http');
 const { URL } = require('url');
-const { Readable } = require('stream');
 
 // ============================================================
-//  WHITELIST VE SABİTLER
+//  WHITELIST
 // ============================================================
 const DEFAULT_ALLOWED_CHANNEL_IDS = [
    '143239535a2e3c23c1d16', //1 BEIN SPOTS1 SD
@@ -119,7 +121,6 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
    '7274274379cbbe0c37b06', //REDBOX ANİMASYON 1
 ];
 
-// BİR KEZ HESAPLA — her istekte env okumaya gerek yok
 const ALLOWED_CHANNEL_SET = (() => {
     const envVal = process.env.ALLOWED_CHANNEL_IDS;
     if (envVal && envVal.trim() !== '') {
@@ -140,14 +141,13 @@ const AUTH_TIMEOUT_MS = 8000;
 const RESOLVE_TIMEOUT_MS = 10000;
 const PLAYLIST_TIMEOUT_MS = 10000;
 
-// Vavoo token'ları ~10 dk ömürlü; cache'i kısa tut
+// Token ~10 dk ömürlü; cache 5 dk
 const AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
 const STREAM_CACHE_TTL_MS = 5 * 60 * 1000;
 const STALE_RETENTION_MS = 10 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 2000;
 
 const SLOW_REQUEST_THRESHOLD_MS = 3000;
-const MAX_RESOLVE_RETRIES = 2;
 
 // ============================================================
 //  YARDIMCILAR
@@ -164,12 +164,11 @@ function getClientIP(req) {
         const explicitIp = url.searchParams.get('ip');
         if (explicitIp && explicitIp.trim()) return explicitIp.trim();
     } catch {}
-    const ip = req.headers['cf-connecting-ip'] ||
+    return req.headers['cf-connecting-ip'] ||
         req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
         req.headers['x-real-ip'] ||
         req.socket?.remoteAddress ||
         null;
-    return ip;
 }
 
 class ExtractorError extends Error {
@@ -215,14 +214,12 @@ class TTLCache {
         this.maxEntries = maxEntries;
         this.lastCleanup = Date.now();
     }
-
     get(key) {
         const entry = this.map.get(key);
         if (!entry) return null;
         if (entry.expiry <= Date.now()) return null;
         return entry.value;
     }
-
     getStale(key) {
         const entry = this.map.get(key);
         if (!entry) return null;
@@ -232,7 +229,6 @@ class TTLCache {
         }
         return entry.value;
     }
-
     set(key, value) {
         if (this.map.size >= this.maxEntries) {
             const firstKey = this.map.keys().next().value;
@@ -241,11 +237,7 @@ class TTLCache {
         this.map.set(key, { value, expiry: Date.now() + this.ttlMs });
         this.cleanupIfNeeded();
     }
-
-    delete(key) {
-        this.map.delete(key);
-    }
-
+    delete(key) { this.map.delete(key); }
     cleanupIfNeeded() {
         const now = Date.now();
         if (now - this.lastCleanup < 60000) return;
@@ -452,200 +444,92 @@ class VavooExtractor {
 }
 
 // ============================================================
-//  HLS PROXY (gerçek proxy — 302 redirect DEĞİL)
+//  YENİLEME (REFRESH) ENDPOINT — istemci periyodik olarak çağırır
+//  Video trafiği YOK, sadece JSON cevap
 // ============================================================
-
-/**
- * Eski stream URL ile yeni stream URL arasındaki "token" segmentini bulup
- * istenen targetUrl'i yeni token'a göre yeniden yazar.
- * Örn: /sunshine/OLDTOK/hls/playlist.m3u8 → /sunshine/NEWTOK/hls/playlist.m3u8
- * Başarısız olursa null döner.
- */
-function remapUrl(oldBaseUrl, newBaseUrl, targetUrl) {
-    try {
-        const o = new URL(oldBaseUrl);
-        const n = new URL(newBaseUrl);
-        const t = new URL(targetUrl);
-
-        if (o.host !== n.host) return null;
-
-        const oSegs = o.pathname.split('/');
-        const nSegs = n.pathname.split('/');
-        const tSegs = t.pathname.split('/');
-
-        const diffs = [];
-        const maxLen = Math.max(oSegs.length, nSegs.length);
-        for (let i = 0; i < maxLen; i++) {
-            if (oSegs[i] !== nSegs[i]) diffs.push(i);
-        }
-        // Sadece TEK segment (token) farklıysa güvenle remap edebiliriz
-        if (diffs.length !== 1) return null;
-        const tokenIdx = diffs[0];
-        if (oSegs[tokenIdx] === undefined || nSegs[tokenIdx] === undefined) return null;
-
-        let replaced = false;
-        for (let i = 0; i < tSegs.length; i++) {
-            if (tSegs[i] === oSegs[tokenIdx]) {
-                tSegs[i] = nSegs[tokenIdx];
-                replaced = true;
-                break;
-            }
-        }
-        if (!replaced) return null;
-
-        t.pathname = tSegs.join('/');
-        return t.toString();
-    } catch {
-        return null;
+async function handleRefresh(req, res) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const vavooUrl = url.searchParams.get('vavoo_url') || url.searchParams.get('url');
+    if (!vavooUrl) {
+        res.writeHead(400, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing vavoo_url parameter' }));
+        return;
     }
-}
-
-/**
- * targetUrl'i proxy'den geçirir.
- * - Manifest ise: içindeki URL'leri /proxy/hls/raw'a yönlendirir
- * - Segment ise: byte-for-byte stream eder
- * - 401/403 gelirse: token'ı yeniler, URL'i remap eder ve tekrar dener
- */
-async function proxyHls(req, res, targetUrl, vavooUrl, extractor, clientIP, depth = 0) {
-    if (depth > MAX_RESOLVE_RETRIES) {
-        res.writeHead(502, CORS_HEADERS);
-        res.end('too many resolve retries');
+    if (!isVavooHost(vavooUrl) || !isAllowedVavooUrl(vavooUrl)) {
+        res.writeHead(403, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Vavoo URL not authorized' }));
         return;
     }
 
-    const origin = getOrigin(req);
+    const clientIP = getClientIP(req);
+    const extractor = new VavooExtractor();
 
-    // ---- 1) Upstream fetch
-    let upstream;
     try {
-        const fh = { 'user-agent': 'okhttp/4.11.0' };
-        if (req.headers.range) fh['range'] = req.headers.range;
-        upstream = await fetchWithTimeout(targetUrl, { headers: fh }, RESOLVE_TIMEOUT_MS);
-    } catch (e) {
-        console.error(`HLS fetch failed: ${targetUrl} — ${e.message}`);
-        res.writeHead(502, CORS_HEADERS);
-        res.end('upstream fetch failed');
-        return;
-    }
-
-    // ---- 2) Token expire → re-resolve & remap & retry
-    if ((upstream.status === 401 || upstream.status === 403) && vavooUrl) {
+        // Cache'i atlayarak her zaman yeni token al
         const cacheKey = `${clientIP}|${vavooUrl}`;
-        const oldStreamUrl = streamCache.getStale(cacheKey);
-
-        authCache.delete(clientIP);
         streamCache.delete(cacheKey);
+        authCache.delete(clientIP);
 
-        let newStreamUrl;
-        try {
-            newStreamUrl = await extractor.resolveStream(vavooUrl, clientIP);
-        } catch (e) {
-            console.error(`Re-resolve failed for ${vavooUrl}: ${e.message}`);
-            res.writeHead(502, CORS_HEADERS);
-            res.end('re-resolve failed');
-            return;
-        }
-
-        let newTarget = oldStreamUrl
-            ? remapUrl(oldStreamUrl, newStreamUrl, targetUrl)
-            : null;
-
-        if (!newTarget) {
-            // Remap yapamadık; en azından yeni stream URL'ini dene
-            console.warn(`Remap failed, falling back to new stream URL for ${targetUrl}`);
-            newTarget = newStreamUrl;
-        }
-
-        // Stream'i tüketmeden discard et
-        try { if (upstream.body) upstream.body.cancel(); } catch {}
-
-        return proxyHls(req, res, newTarget, vavooUrl, extractor, clientIP, depth + 1);
-    }
-
-    if (!upstream.ok && upstream.status !== 206) {
-        res.writeHead(upstream.status, CORS_HEADERS);
-        res.end();
-        return;
-    }
-
-    const contentType = upstream.headers.get('content-type') || '';
-    const isManifest =
-        contentType.includes('mpegurl') ||
-        contentType.includes('m3u') ||
-        targetUrl.split('?')[0].toLowerCase().endsWith('.m3u8');
-
-    // ---- 3) Manifest ise rewrite et
-    if (isManifest) {
-        let text;
-        try {
-            text = await upstream.text();
-        } catch (e) {
-            console.error(`Manifest read failed: ${e.message}`);
-            res.writeHead(502, CORS_HEADERS);
-            res.end('manifest read failed');
-            return;
-        }
-
-        const base = new URL(targetUrl);
-        const vParam = vavooUrl ? `&v=${encodeURIComponent(vavooUrl)}` : '';
-        const rawPrefix = `${origin}/proxy/hls/raw?d=`;
-
-        const rewritten = text.split('\n').map(line => {
-            const trimmed = line.trim();
-            if (!trimmed) return line;
-
-            // Tag satırı: URI="..." alanlarını da proxy'le
-            if (trimmed.startsWith('#')) {
-                return line.replace(/URI="([^"]+)"/g, (m, uri) => {
-                    try {
-                        const abs = new URL(uri, base).toString();
-                        return `URI="${rawPrefix}${encodeURIComponent(abs)}${vParam}"`;
-                    } catch { return m; }
-                });
-            }
-
-            // URL satırı
-            try {
-                const abs = new URL(trimmed, base).toString();
-                return `${rawPrefix}${encodeURIComponent(abs)}${vParam}`;
-            } catch {
-                return line;
-            }
-        }).join('\n');
+        const freshUrl = await extractor.resolveStream(vavooUrl, clientIP);
+        const ttlSeconds = STREAM_CACHE_TTL_MS / 1000;
 
         res.writeHead(200, {
             ...CORS_HEADERS,
-            'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
         });
-        res.end(rewritten);
+        res.end(JSON.stringify({
+            url: freshUrl,
+            vavoo_url: vavooUrl,
+            expires_in: ttlSeconds,
+            next_refresh_in: Math.max(60, ttlSeconds - 30),
+            timestamp: new Date().toISOString(),
+        }));
+    } catch (e) {
+        console.error(`Refresh failed for ${vavooUrl}: ${e.message}`);
+        res.writeHead(502, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Refresh failed', detail: e.message }));
+    }
+}
+
+// ============================================================
+//  MANIFEST (302 REDIRECT — video trafiği Render'dan geçmez)
+// ============================================================
+async function handleManifestRedirect(req, res, targetUrl) {
+    const clientIP = getClientIP(req);
+
+    if (clientIP && clientIP.includes(':')) {
+        res.writeHead(403, CORS_HEADERS);
+        res.end('IPv6 connections are not allowed for this service. Please disable IPv6.');
         return;
     }
 
-    // ---- 4) Segment / binary → stream et
-    const out = { ...CORS_HEADERS };
-    out['Content-Type'] = contentType || 'application/octet-stream';
-    const cl = upstream.headers.get('content-length');
-    if (cl) out['Content-Length'] = cl;
-    const cr = upstream.headers.get('content-range');
-    if (cr) out['Content-Range'] = cr;
-    const ar = upstream.headers.get('accept-ranges');
-    if (ar) out['Accept-Ranges'] = ar;
-    out['Cache-Control'] = 'public, max-age=30';
+    const startTime = Date.now();
+    const extractor = new VavooExtractor();
 
-    res.writeHead(upstream.status, out);
-
-    if (!upstream.body) {
-        res.end();
+    let streamUrl;
+    try {
+        streamUrl = await extractor.resolveStream(targetUrl, clientIP);
+    } catch (e) {
+        console.error(`Resolve failed for ${targetUrl}: ${e.message}`);
+        res.writeHead(502, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to resolve stream.', detail: e.message }));
         return;
     }
 
-    const stream = Readable.fromWeb(upstream.body);
-    stream.on('error', (e) => {
-        console.error(`Stream pipe error: ${e.message}`);
-        try { res.destroy(); } catch {}
+    const elapsed = Date.now() - startTime;
+    if (elapsed > SLOW_REQUEST_THRESHOLD_MS) {
+        console.warn(`Slow resolve: ${elapsed}ms for ${targetUrl}`);
+    }
+
+    // 302 redirect: player doğrudan Vavoo CDN'e gider
+    // Render'dan sadece ~200 byte'lık yönlendirme çıkar
+    res.writeHead(302, {
+        ...CORS_HEADERS,
+        'Location': streamUrl,
+        'Cache-Control': 'private, max-age=60',
     });
-    stream.pipe(res);
+    res.end();
 }
 
 // ============================================================
@@ -713,6 +597,7 @@ function rewritePlaylistUrls(m3uContent, origin) {
             if (isVavooHost(t)) {
                 if (isAllowedVavooUrl(t)) {
                     parts.push(lastExtinf);
+                    // Liste içinde manifest endpoint'ine yönlendir
                     parts.push(`${origin}/manifest.m3u8?url=${encodeURIComponent(t)}`);
                 }
             } else {
@@ -726,7 +611,7 @@ function rewritePlaylistUrls(m3uContent, origin) {
 }
 
 // ============================================================
-//  INFO & STATUS
+//  INFO SAYFASI
 // ============================================================
 function handleInfoPage(req, res) {
     const origin = getOrigin(req);
@@ -735,7 +620,7 @@ function handleInfoPage(req, res) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Vavoo Stream Extractor</title>
+  <title>Vavoo Smart Redirect</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
       :root { --bg-primary:#0a0a0b; --bg-card:#16181c; --text-primary:#fff; --text-secondary:#b3b3b3; --accent-primary:#3b82f6; --accent-green:#10b981; --border-color:#374151; --gradient:linear-gradient(135deg,#667eea 0%,#764ba2 100%); }
@@ -753,20 +638,26 @@ function handleInfoPage(req, res) {
       .endpoint-code { background:#1a1a1d; border:1px solid var(--border-color); border-radius:0.8rem; padding:1rem; font-family:'SF Mono',monospace; font-size:0.9rem; color:var(--accent-primary); word-break:break-all; }
       .footer { text-align:center; margin-top:4rem; padding:2rem 0; border-top:1px solid var(--border-color); color:#6b7280; }
       .warning { color:#f59e0b; font-weight:500; }
+      .green { color:var(--accent-green); font-weight:600; }
   </style>
 </head>
 <body>
   <div class="container">
       <header class="header">
-          <h1>Vavoo Stream Extractor</h1>
-          <div class="version-badge"><span>v2.0</span><span class="status-badge">ONLINE</span></div>
-          <p class="description">Anti-freeze HLS proxy + otomatik token yenileme (Node.js / Render).</p>
+          <h1>Vavoo Smart Redirect</h1>
+          <div class="version-badge"><span>v3.0</span><span class="status-badge">ONLINE</span></div>
+          <p class="description">302 yönlendirme + token refresh mimarisi. <span class="green">Video trafiği Render'dan geçmez.</span></p>
       </header>
       <div class="cards-grid">
           <div class="card">
-              <h3 class="card-title">Stream Extraction (HLS Proxy)</h3>
-              <p class="card-description">Yetkili Vavoo URL'si için tam HLS proxy. Master/media playlist ve segmentler proxy'den geçer, token expire olunca otomatik yenilenir.<br><span class="warning">Not:</span> Stream donuyorsa IPv6 kapat.</p>
+              <h3 class="card-title">Manifest (302 Redirect)</h3>
+              <p class="card-description">Yetkili Vavoo URL'si için 302 redirect. Player doğrudan Vavoo'ya bağlanır, Render sadece ~200 byte yönlendirme gönderir.</p>
               <div class="endpoint-code">${origin}/manifest.m3u8?url=&lt;VAVOO_URL&gt;</div>
+          </div>
+          <div class="card">
+              <h3 class="card-title">Token Refresh (JSON)</h3>
+              <p class="card-description">Player periyodik olarak (örn. 5 dk) bu endpoint'i çağırıp taze stream URL'i alır. Video verisi yok, sadece JSON.</p>
+              <div class="endpoint-code">${origin}/refresh?vavoo_url=&lt;VAVOO_URL&gt;</div>
           </div>
           <div class="card">
               <h3 class="card-title">Playlist Proxy</h3>
@@ -779,7 +670,7 @@ function handleInfoPage(req, res) {
               <div class="endpoint-code">${origin}/status</div>
           </div>
       </div>
-      <footer class="footer"><p>&copy; 2025 Vavoo Extractor</p></footer>
+      <footer class="footer"><p>&copy; 2025 Vavoo Smart Redirect — Bant genişliği dostu</p></footer>
   </div>
 </body>
 </html>`;
@@ -787,12 +678,15 @@ function handleInfoPage(req, res) {
     res.end(html);
 }
 
+// ============================================================
+//  STATUS
+// ============================================================
 function handleStatus(req, res) {
     const clientIP = getClientIP(req) || '';
     const origin = getOrigin(req);
     const statusInfo = {
         status: "operational",
-        version: "2.0-node",
+        version: "3.0-smart-redirect",
         timestamp: new Date().toISOString(),
         client_info: {
             ip: clientIP,
@@ -810,14 +704,19 @@ function handleStatus(req, res) {
             stream_ttl_minutes: STREAM_CACHE_TTL_MS / 60000,
             stale_retention_minutes: STALE_RETENTION_MS / 60000,
         },
-        supported_services: {
-            vavoo: { mode: "hls-proxy", path: "/manifest.m3u8?url=https://vavoo.to/..." },
+        architecture: {
+            mode: "302-redirect",
+            video_traffic_through_render: false,
+            bandwidth_used_per_play: "~200 bytes (redirect only)",
+            refresh_endpoint: `${origin}/refresh?vavoo_url=<url>`,
+            recommended_refresh_interval_seconds: 300,
         },
         endpoints: {
             info: `${origin}/`,
             status: `${origin}/status`,
+            manifest: `${origin}/manifest.m3u8?url=<vavoo_url>`,
+            refresh: `${origin}/refresh?vavoo_url=<vavoo_url>`,
             playlist_proxy: `${origin}/playlist?url=<m3u_url>`,
-            hls_raw: `${origin}/proxy/hls/raw?d=<encoded_url>&v=<encoded_vavoo_url>`,
         }
     };
     res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
@@ -837,20 +736,31 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     try {
+        // ---- INFO
         if (url.pathname === '/' || url.pathname === '') {
             handleInfoPage(req, res);
             return;
         }
+
+        // ---- STATUS
         if (url.pathname === '/status') {
             handleStatus(req, res);
             return;
         }
+
+        // ---- PLAYLIST PROXY
         if (url.pathname === '/playlist') {
             await handlePlaylistProxy(req, res);
             return;
         }
 
-        // ---- /manifest.m3u8 ve /proxy/hls/manifest.m3u8 → HLS proxy
+        // ---- REFRESH (JSON — istemci periyodik çağırır)
+        if (url.pathname === '/refresh') {
+            await handleRefresh(req, res);
+            return;
+        }
+
+        // ---- MANIFEST → 302 REDIRECT
         if (url.pathname === '/manifest.m3u8' || url.pathname === '/proxy/hls/manifest.m3u8') {
             const paramName = url.pathname === '/manifest.m3u8' ? 'url' : 'd';
             if (!url.searchParams.has(paramName)) {
@@ -871,52 +781,11 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
-            const clientIP = getClientIP(req);
-            if (clientIP && clientIP.includes(':')) {
-                res.writeHead(403, CORS_HEADERS);
-                res.end('IPv6 connections are not allowed for this service. Please disable IPv6.');
-                return;
-            }
-
-            const startTime = Date.now();
-            const extractor = new VavooExtractor();
-
-            let streamUrl;
-            try {
-                streamUrl = await extractor.resolveStream(targetUrl, clientIP);
-            } catch (e) {
-                console.error(`Initial resolve failed: ${e.message}`);
-                res.writeHead(502, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Failed to resolve stream.', detail: e.message }));
-                return;
-            }
-
-            const elapsed = Date.now() - startTime;
-            if (elapsed > SLOW_REQUEST_THRESHOLD_MS) {
-                console.warn(`Slow manifest request: ${elapsed}ms for ${targetUrl}`);
-            }
-
-            await proxyHls(req, res, streamUrl, targetUrl, extractor, clientIP);
+            await handleManifestRedirect(req, res, targetUrl);
             return;
         }
 
-        // ---- /proxy/hls/raw → media playlist & segment proxy
-        if (url.pathname === '/proxy/hls/raw') {
-            const targetUrl = url.searchParams.get('d');
-            const vavooUrl = url.searchParams.get('v');
-
-            if (!targetUrl) {
-                res.writeHead(400, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Missing "d" parameter' }));
-                return;
-            }
-
-            const clientIP = getClientIP(req);
-            const extractor = new VavooExtractor();
-            await proxyHls(req, res, targetUrl, vavooUrl, extractor, clientIP);
-            return;
-        }
-
+        // ---- 404
         res.writeHead(404, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: '404 Not Found' }));
 
@@ -933,5 +802,7 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
-    console.log(`Vavoo Extractor v2.0 listening on port ${PORT}`);
+    console.log(`Vavoo Smart Redirect v3.0 listening on port ${PORT}`);
+    console.log(`Architecture: 302 redirect + token refresh`);
+    console.log(`Video traffic: NOT through this server`);
 });
