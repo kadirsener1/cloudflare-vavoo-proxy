@@ -1,12 +1,13 @@
 /**
  * Node.js uyarlaması - Render.com için
- * Orijinal Deno Deploy koduyla aynı işlevselliği sunar.
+ * HLS proxy + token yenileme + anti-freeze
  */
 const http = require('http');
 const { URL } = require('url');
+const { Readable } = require('stream');
 
 // ============================================================
-//  AYNI WHITELIST VE SABİTLER
+//  WHITELIST VE SABİTLER
 // ============================================================
 const DEFAULT_ALLOWED_CHANNEL_IDS = [
    '143239535a2e3c23c1d16', //1 BEIN SPOTS1 SD
@@ -102,11 +103,8 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
    //HABER
    '41338152650143743f9d7', //CNN FHD
    '3278683973d0eaa4e57d76', //CNN2
-   '194868101172e4362de24e', //akit tv
-   '960578312ee36cc17c5d2', //sozcu
    //BELGESEL
 '361703541447c2d8cea904', //87 BEİN GURME
-'16912230784a73b11d66ed', //BEİN İZ
 '178850393550c13d869fbf', // 88 YABAN TV
 '1165670263945583e36e19', //viasat history
 '17854799144cbb1c340ac1', // special box belgesel
@@ -115,11 +113,16 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
    //ÇOCUK
    '11743931b356e8661a4d', // Cartonito
    '2046583925cdbd476d8733', //Anigo Zorex
-
-   
-    
-    // 'buraya_yeni_kanal_id_ekle',
 ];
+
+// BİR KEZ HESAPLA — her istekte env okumaya gerek yok
+const ALLOWED_CHANNEL_SET = (() => {
+    const envVal = process.env.ALLOWED_CHANNEL_IDS;
+    if (envVal && envVal.trim() !== '') {
+        return new Set(envVal.split(',').map(s => s.trim()).filter(Boolean));
+    }
+    return new Set(DEFAULT_ALLOWED_CHANNEL_IDS);
+})();
 
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
@@ -130,29 +133,39 @@ const CORS_HEADERS = {
 };
 
 const AUTH_TIMEOUT_MS = 8000;
-const RESOLVE_TIMEOUT_MS = 8000;
+const RESOLVE_TIMEOUT_MS = 10000;
 const PLAYLIST_TIMEOUT_MS = 10000;
 
-const AUTH_CACHE_TTL_MS = 15 * 60 * 1000;
-const STREAM_CACHE_TTL_MS = 15 * 60 * 1000;
-const STALE_RETENTION_MS = 30 * 60 * 1000;
+// Vavoo token'ları ~10 dk ömürlü; cache'i kısa tut
+const AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
+const STREAM_CACHE_TTL_MS = 5 * 60 * 1000;
+const STALE_RETENTION_MS = 10 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 2000;
 
 const SLOW_REQUEST_THRESHOLD_MS = 3000;
+const MAX_RESOLVE_RETRIES = 2;
 
 // ============================================================
 //  YARDIMCILAR
 // ============================================================
+function getOrigin(req) {
+    const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    return `${proto}://${host}`;
+}
+
 function getClientIP(req) {
     try {
         const url = new URL(req.url, `http://${req.headers.host}`);
         const explicitIp = url.searchParams.get('ip');
         if (explicitIp && explicitIp.trim()) return explicitIp.trim();
     } catch {}
-    return req.headers['cf-connecting-ip'] ||
+    const ip = req.headers['cf-connecting-ip'] ||
         req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
         req.headers['x-real-ip'] ||
-        '127.0.0.1';
+        req.socket?.remoteAddress ||
+        null;
+    return ip;
 }
 
 class ExtractorError extends Error {
@@ -161,14 +174,6 @@ class ExtractorError extends Error {
         this.name = 'ExtractorError';
         this.status = status;
     }
-}
-
-function getAllowedChannelIds() {
-    const envVal = process.env.ALLOWED_CHANNEL_IDS;
-    if (envVal && envVal.trim() !== '') {
-        return new Set(envVal.split(',').map(s => s.trim()).filter(Boolean));
-    }
-    return new Set(DEFAULT_ALLOWED_CHANNEL_IDS);
 }
 
 function isVavooHost(url) {
@@ -191,13 +196,13 @@ function extractVavooChannelId(url) {
     }
 }
 
-function isAllowedVavooUrl(url, allowedSet) {
+function isAllowedVavooUrl(url) {
     const id = extractVavooChannelId(url);
-    return id !== null && allowedSet.has(id);
+    return id !== null && ALLOWED_CHANNEL_SET.has(id);
 }
 
 // ============================================================
-//  TTL CACHE (Node.js Map tabanlı)
+//  TTL CACHE
 // ============================================================
 class TTLCache {
     constructor(ttlMs, maxEntries = MAX_CACHE_ENTRIES) {
@@ -282,7 +287,7 @@ async function fetchWithRetry(url, options, timeoutMs, retries = 1) {
 }
 
 // ============================================================
-//  VAVOO EXTRACTOR (Node.js sınıfı)
+//  VAVOO EXTRACTOR
 // ============================================================
 class VavooExtractor {
     async getAuthSignature(clientIP) {
@@ -330,8 +335,8 @@ class VavooExtractor {
             "accept": "application/json",
             "content-type": "application/json; charset=utf-8",
             "accept-encoding": "gzip",
-            "X-Forwarded-For": clientIP,
-            "X-Real-IP": clientIP,
+            "X-Forwarded-For": clientIP || '',
+            "X-Real-IP": clientIP || '',
         };
 
         const response = await fetchWithRetry("https://www.lokke.app/api/app/ping", {
@@ -384,7 +389,6 @@ class VavooExtractor {
             return streamUrl;
         } catch (err) {
             if (err.status === 401 || err.status === 403) {
-                console.warn(`Auth expired for ${clientIP}, refreshing...`);
                 authCache.delete(clientIP);
                 try {
                     const newSig = await this.getAuthSignature(clientIP);
@@ -418,8 +422,8 @@ class VavooExtractor {
             "content-type": "application/json; charset=utf-8",
             "accept-encoding": "gzip",
             "mediahubmx-signature": signature,
-            "X-Forwarded-For": clientIP,
-            "X-Real-IP": clientIP,
+            "X-Forwarded-For": clientIP || '',
+            "X-Real-IP": clientIP || '',
         };
 
         const response = await fetchWithRetry("https://vavoo.to/mediahubmx-resolve.json", {
@@ -441,43 +445,209 @@ class VavooExtractor {
         if (!streamUrl) throw new ExtractorError('Vavoo resolve response contains no valid stream URL.');
         return streamUrl;
     }
-
-    async handle(url, req, res, allowedSet) {
-        const startTime = Date.now();
-        const clientIP = getClientIP(req);
-
-        if (clientIP && clientIP.includes(':')) {
-            res.writeHead(403, CORS_HEADERS);
-            res.end('IPv6 connections are not allowed for this service. Please disable IPv6.');
-            return;
-        }
-
-        if (!isAllowedVavooUrl(url, allowedSet)) {
-            res.writeHead(403, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'This Vavoo channel is not authorized on this worker.' }));
-            return;
-        }
-
-        const streamUrl = await this.resolveStream(url, clientIP);
-
-        const elapsed = Date.now() - startTime;
-        if (elapsed > SLOW_REQUEST_THRESHOLD_MS) {
-            console.warn(`Slow manifest request: ${elapsed}ms for ${url}`);
-        }
-
-        res.writeHead(302, {
-            ...CORS_HEADERS,
-            'Location': streamUrl,
-            'Cache-Control': 'private, max-age=60',
-        });
-        res.end();
-    }
 }
 
 // ============================================================
-//  PLAYLIST PROXY (Node.js)
+//  HLS PROXY (gerçek proxy — 302 redirect DEĞİL)
 // ============================================================
-async function handlePlaylistProxy(req, res, allowedSet) {
+
+/**
+ * Eski stream URL ile yeni stream URL arasındaki "token" segmentini bulup
+ * istenen targetUrl'i yeni token'a göre yeniden yazar.
+ * Örn: /sunshine/OLDTOK/hls/playlist.m3u8 → /sunshine/NEWTOK/hls/playlist.m3u8
+ * Başarısız olursa null döner.
+ */
+function remapUrl(oldBaseUrl, newBaseUrl, targetUrl) {
+    try {
+        const o = new URL(oldBaseUrl);
+        const n = new URL(newBaseUrl);
+        const t = new URL(targetUrl);
+
+        if (o.host !== n.host) return null;
+
+        const oSegs = o.pathname.split('/');
+        const nSegs = n.pathname.split('/');
+        const tSegs = t.pathname.split('/');
+
+        const diffs = [];
+        const maxLen = Math.max(oSegs.length, nSegs.length);
+        for (let i = 0; i < maxLen; i++) {
+            if (oSegs[i] !== nSegs[i]) diffs.push(i);
+        }
+        // Sadece TEK segment (token) farklıysa güvenle remap edebiliriz
+        if (diffs.length !== 1) return null;
+        const tokenIdx = diffs[0];
+        if (oSegs[tokenIdx] === undefined || nSegs[tokenIdx] === undefined) return null;
+
+        let replaced = false;
+        for (let i = 0; i < tSegs.length; i++) {
+            if (tSegs[i] === oSegs[tokenIdx]) {
+                tSegs[i] = nSegs[tokenIdx];
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) return null;
+
+        t.pathname = tSegs.join('/');
+        return t.toString();
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * targetUrl'i proxy'den geçirir.
+ * - Manifest ise: içindeki URL'leri /proxy/hls/raw'a yönlendirir
+ * - Segment ise: byte-for-byte stream eder
+ * - 401/403 gelirse: token'ı yeniler, URL'i remap eder ve tekrar dener
+ */
+async function proxyHls(req, res, targetUrl, vavooUrl, extractor, clientIP, depth = 0) {
+    if (depth > MAX_RESOLVE_RETRIES) {
+        res.writeHead(502, CORS_HEADERS);
+        res.end('too many resolve retries');
+        return;
+    }
+
+    const origin = getOrigin(req);
+
+    // ---- 1) Upstream fetch
+    let upstream;
+    try {
+        const fh = { 'user-agent': 'okhttp/4.11.0' };
+        if (req.headers.range) fh['range'] = req.headers.range;
+        upstream = await fetchWithTimeout(targetUrl, { headers: fh }, RESOLVE_TIMEOUT_MS);
+    } catch (e) {
+        console.error(`HLS fetch failed: ${targetUrl} — ${e.message}`);
+        res.writeHead(502, CORS_HEADERS);
+        res.end('upstream fetch failed');
+        return;
+    }
+
+    // ---- 2) Token expire → re-resolve & remap & retry
+    if ((upstream.status === 401 || upstream.status === 403) && vavooUrl) {
+        const cacheKey = `${clientIP}|${vavooUrl}`;
+        const oldStreamUrl = streamCache.getStale(cacheKey);
+
+        authCache.delete(clientIP);
+        streamCache.delete(cacheKey);
+
+        let newStreamUrl;
+        try {
+            newStreamUrl = await extractor.resolveStream(vavooUrl, clientIP);
+        } catch (e) {
+            console.error(`Re-resolve failed for ${vavooUrl}: ${e.message}`);
+            res.writeHead(502, CORS_HEADERS);
+            res.end('re-resolve failed');
+            return;
+        }
+
+        let newTarget = oldStreamUrl
+            ? remapUrl(oldStreamUrl, newStreamUrl, targetUrl)
+            : null;
+
+        if (!newTarget) {
+            // Remap yapamadık; en azından yeni stream URL'ini dene
+            console.warn(`Remap failed, falling back to new stream URL for ${targetUrl}`);
+            newTarget = newStreamUrl;
+        }
+
+        // Stream'i tüketmeden discard et
+        try { if (upstream.body) upstream.body.cancel(); } catch {}
+
+        return proxyHls(req, res, newTarget, vavooUrl, extractor, clientIP, depth + 1);
+    }
+
+    if (!upstream.ok && upstream.status !== 206) {
+        res.writeHead(upstream.status, CORS_HEADERS);
+        res.end();
+        return;
+    }
+
+    const contentType = upstream.headers.get('content-type') || '';
+    const isManifest =
+        contentType.includes('mpegurl') ||
+        contentType.includes('m3u') ||
+        targetUrl.split('?')[0].toLowerCase().endsWith('.m3u8');
+
+    // ---- 3) Manifest ise rewrite et
+    if (isManifest) {
+        let text;
+        try {
+            text = await upstream.text();
+        } catch (e) {
+            console.error(`Manifest read failed: ${e.message}`);
+            res.writeHead(502, CORS_HEADERS);
+            res.end('manifest read failed');
+            return;
+        }
+
+        const base = new URL(targetUrl);
+        const vParam = vavooUrl ? `&v=${encodeURIComponent(vavooUrl)}` : '';
+        const rawPrefix = `${origin}/proxy/hls/raw?d=`;
+
+        const rewritten = text.split('\n').map(line => {
+            const trimmed = line.trim();
+            if (!trimmed) return line;
+
+            // Tag satırı: URI="..." alanlarını da proxy'le
+            if (trimmed.startsWith('#')) {
+                return line.replace(/URI="([^"]+)"/g, (m, uri) => {
+                    try {
+                        const abs = new URL(uri, base).toString();
+                        return `URI="${rawPrefix}${encodeURIComponent(abs)}${vParam}"`;
+                    } catch { return m; }
+                });
+            }
+
+            // URL satırı
+            try {
+                const abs = new URL(trimmed, base).toString();
+                return `${rawPrefix}${encodeURIComponent(abs)}${vParam}`;
+            } catch {
+                return line;
+            }
+        }).join('\n');
+
+        res.writeHead(200, {
+            ...CORS_HEADERS,
+            'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+        });
+        res.end(rewritten);
+        return;
+    }
+
+    // ---- 4) Segment / binary → stream et
+    const out = { ...CORS_HEADERS };
+    out['Content-Type'] = contentType || 'application/octet-stream';
+    const cl = upstream.headers.get('content-length');
+    if (cl) out['Content-Length'] = cl;
+    const cr = upstream.headers.get('content-range');
+    if (cr) out['Content-Range'] = cr;
+    const ar = upstream.headers.get('accept-ranges');
+    if (ar) out['Accept-Ranges'] = ar;
+    out['Cache-Control'] = 'public, max-age=30';
+
+    res.writeHead(upstream.status, out);
+
+    if (!upstream.body) {
+        res.end();
+        return;
+    }
+
+    const stream = Readable.fromWeb(upstream.body);
+    stream.on('error', (e) => {
+        console.error(`Stream pipe error: ${e.message}`);
+        try { res.destroy(); } catch {}
+    });
+    stream.pipe(res);
+}
+
+// ============================================================
+//  PLAYLIST PROXY
+// ============================================================
+async function handlePlaylistProxy(req, res) {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const m3uUrlsParam = url.searchParams.get('url');
     if (!m3uUrlsParam) {
@@ -493,23 +663,21 @@ async function handlePlaylistProxy(req, res, allowedSet) {
         return;
     }
 
-    const fetchPromises = m3uUrls.map(async (m3uUrl) => {
+    const results = await Promise.all(m3uUrls.map(async (m3uUrl) => {
         try {
-            const response = await fetchWithTimeout(m3uUrl, {
+            const r = await fetchWithTimeout(m3uUrl, {
                 headers: { 'User-Agent': 'Mozilla/5.0' },
             }, PLAYLIST_TIMEOUT_MS);
-            if (response.ok) return await response.text();
+            if (r.ok) return await r.text();
         } catch (e) {
             console.error(`Failed to fetch playlist ${m3uUrl}: ${e.message}`);
         }
         return '';
-    });
+    }));
 
-    const results = await Promise.all(fetchPromises);
-    const combinedM3U = results.filter(t => t).join('\n');
-
-    const workerDomain = url.origin;
-    const modifiedM3U = rewritePlaylistUrls(combinedM3U, workerDomain, allowedSet);
+    const combined = results.filter(t => t).join('\n');
+    const origin = getOrigin(req);
+    const modified = rewritePlaylistUrls(combined, origin);
 
     res.writeHead(200, {
         ...CORS_HEADERS,
@@ -517,50 +685,48 @@ async function handlePlaylistProxy(req, res, allowedSet) {
         'Content-Disposition': 'inline; filename="playlist.m3u"',
         'Cache-Control': 'public, s-maxage=3600, stale-while-revalidate=600',
     });
-    res.end(modifiedM3U);
+    res.end(modified);
 }
 
-function rewritePlaylistUrls(m3uContent, workerDomain, allowedSet) {
+function rewritePlaylistUrls(m3uContent, origin) {
     const lines = m3uContent.split('\n');
-    const processedM3uParts = [];
+    const parts = [];
     let lastExtinf = null;
 
-    if (!lines[0]?.startsWith('#EXTM3U')) {
-        processedM3uParts.push('#EXTM3U');
-    }
+    if (!lines[0]?.startsWith('#EXTM3U')) parts.push('#EXTM3U');
 
     for (const line of lines) {
-        const trimmedLine = line.trim();
-        if (!trimmedLine) continue;
+        const t = line.trim();
+        if (!t) continue;
 
-        if (trimmedLine.startsWith('#EXTM3U')) {
-            if (!processedM3uParts.includes('#EXTM3U')) processedM3uParts.push(trimmedLine);
-        } else if (trimmedLine.startsWith('#EXTINF:')) {
-            lastExtinf = trimmedLine;
-        } else if (trimmedLine.startsWith('#EXTVLCOPT:')) {
-            processedM3uParts.push(trimmedLine);
-        } else if (trimmedLine.startsWith('http') && lastExtinf) {
-            if (isVavooHost(trimmedLine)) {
-                if (isAllowedVavooUrl(trimmedLine, allowedSet)) {
-                    processedM3uParts.push(lastExtinf);
-                    processedM3uParts.push(`${workerDomain}/manifest.m3u8?url=${encodeURIComponent(trimmedLine)}`);
+        if (t.startsWith('#EXTM3U')) {
+            if (!parts.includes('#EXTM3U')) parts.push(t);
+        } else if (t.startsWith('#EXTINF:')) {
+            lastExtinf = t;
+        } else if (t.startsWith('#EXTVLCOPT:')) {
+            parts.push(t);
+        } else if (t.startsWith('http') && lastExtinf) {
+            if (isVavooHost(t)) {
+                if (isAllowedVavooUrl(t)) {
+                    parts.push(lastExtinf);
+                    parts.push(`${origin}/manifest.m3u8?url=${encodeURIComponent(t)}`);
                 }
             } else {
-                processedM3uParts.push(lastExtinf);
-                processedM3uParts.push(trimmedLine);
+                parts.push(lastExtinf);
+                parts.push(t);
             }
             lastExtinf = null;
         }
     }
-    return processedM3uParts.join('\n');
+    return parts.join('\n');
 }
 
 // ============================================================
-//  INFO & STATUS (Node.js)
+//  INFO & STATUS
 // ============================================================
 function handleInfoPage(req, res) {
-    const workerDomain = `http://${req.headers.host}`;
-    const htmlContent = `<!DOCTYPE html>
+    const origin = getOrigin(req);
+    const html = `<!DOCTYPE html>
 <html lang="tr">
 <head>
   <meta charset="UTF-8">
@@ -589,24 +755,24 @@ function handleInfoPage(req, res) {
   <div class="container">
       <header class="header">
           <h1>Vavoo Stream Extractor</h1>
-          <div class="version-badge"><span>v1.4</span><span class="status-badge">ONLINE</span></div>
-          <p class="description">Anti-freeze optimizasyonlu Vavoo stream extractor (Node.js / Render).</p>
+          <div class="version-badge"><span>v2.0</span><span class="status-badge">ONLINE</span></div>
+          <p class="description">Anti-freeze HLS proxy + otomatik token yenileme (Node.js / Render).</p>
       </header>
       <div class="cards-grid">
           <div class="card">
-              <h3 class="card-title">Stream Extraction</h3>
-              <p class="card-description">Yetkili Vavoo URL'si için 302 redirect.<br><span class="warning">Not:</span> Stream donuyorsa IPv6 kapat.</p>
-              <div class="endpoint-code">${workerDomain}/manifest.m3u8?url=&lt;VAVOO_URL&gt;</div>
+              <h3 class="card-title">Stream Extraction (HLS Proxy)</h3>
+              <p class="card-description">Yetkili Vavoo URL'si için tam HLS proxy. Master/media playlist ve segmentler proxy'den geçer, token expire olunca otomatik yenilenir.<br><span class="warning">Not:</span> Stream donuyorsa IPv6 kapat.</p>
+              <div class="endpoint-code">${origin}/manifest.m3u8?url=&lt;VAVOO_URL&gt;</div>
           </div>
           <div class="card">
               <h3 class="card-title">Playlist Proxy</h3>
               <p class="card-description">Bir veya daha fazla M3U (noktalı virgülle). Sadece yetkili Vavoo kanalları listeye girer.</p>
-              <div class="endpoint-code">${workerDomain}/playlist?url=&lt;URL1&gt;;&lt;URL2&gt;</div>
+              <div class="endpoint-code">${origin}/playlist?url=&lt;URL1&gt;;&lt;URL2&gt;</div>
           </div>
           <div class="card">
               <h3 class="card-title">Status</h3>
               <p class="card-description">Cache istatistikleri ve durum.</p>
-              <div class="endpoint-code">${workerDomain}/status</div>
+              <div class="endpoint-code">${origin}/status</div>
           </div>
       </div>
       <footer class="footer"><p>&copy; 2025 Vavoo Extractor</p></footer>
@@ -614,14 +780,15 @@ function handleInfoPage(req, res) {
 </body>
 </html>`;
     res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(htmlContent);
+    res.end(html);
 }
 
-function handleStatus(req, res, allowedSet) {
-    const clientIP = getClientIP(req);
+function handleStatus(req, res) {
+    const clientIP = getClientIP(req) || '';
+    const origin = getOrigin(req);
     const statusInfo = {
         status: "operational",
-        version: "1.4-node",
+        version: "2.0-node",
         timestamp: new Date().toISOString(),
         client_info: {
             ip: clientIP,
@@ -629,7 +796,7 @@ function handleStatus(req, res, allowedSet) {
             user_agent: req.headers['user-agent'] || 'unknown',
             is_ipv6: clientIP.includes(':'),
         },
-        whitelist: { enabled: true, allowed_channel_count: allowedSet.size },
+        whitelist: { enabled: true, allowed_channel_count: ALLOWED_CHANNEL_SET.size },
         cache_stats: {
             auth_cache_size: authCache.map.size,
             stream_cache_size: streamCache.map.size,
@@ -640,12 +807,13 @@ function handleStatus(req, res, allowedSet) {
             stale_retention_minutes: STALE_RETENTION_MS / 60000,
         },
         supported_services: {
-            vavoo: { mode: "redirect", path: "/manifest.m3u8?url=https://vavoo.to/..." },
+            vavoo: { mode: "hls-proxy", path: "/manifest.m3u8?url=https://vavoo.to/..." },
         },
         endpoints: {
-            info: `http://${req.headers.host}/`,
-            status: `http://${req.headers.host}/status`,
-            playlist_proxy: `http://${req.headers.host}/playlist?url=<m3u_url>`,
+            info: `${origin}/`,
+            status: `${origin}/status`,
+            playlist_proxy: `${origin}/playlist?url=<m3u_url>`,
+            hls_raw: `${origin}/proxy/hls/raw?d=<encoded_url>&v=<encoded_vavoo_url>`,
         }
     };
     res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
@@ -653,7 +821,7 @@ function handleStatus(req, res, allowedSet) {
 }
 
 // ============================================================
-//  ANA SUNUCU (Node.js HTTP)
+//  ANA SUNUCU
 // ============================================================
 const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
@@ -663,7 +831,6 @@ const server = http.createServer(async (req, res) => {
     }
 
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const allowedSet = getAllowedChannelIds();
 
     try {
         if (url.pathname === '/' || url.pathname === '') {
@@ -671,56 +838,78 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         if (url.pathname === '/status') {
-            handleStatus(req, res, allowedSet);
+            handleStatus(req, res);
             return;
         }
         if (url.pathname === '/playlist') {
-            await handlePlaylistProxy(req, res, allowedSet);
+            await handlePlaylistProxy(req, res);
             return;
         }
 
-        if (url.pathname === '/manifest.m3u8') {
-            if (!url.searchParams.has('url')) {
+        // ---- /manifest.m3u8 ve /proxy/hls/manifest.m3u8 → HLS proxy
+        if (url.pathname === '/manifest.m3u8' || url.pathname === '/proxy/hls/manifest.m3u8') {
+            const paramName = url.pathname === '/manifest.m3u8' ? 'url' : 'd';
+            if (!url.searchParams.has(paramName)) {
                 res.writeHead(400, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Missing "url" parameter' }));
+                res.end(JSON.stringify({ error: `Missing "${paramName}" parameter` }));
                 return;
             }
-            const targetUrl = url.searchParams.get('url');
+            const targetUrl = url.searchParams.get(paramName);
 
             if (!isVavooHost(targetUrl)) {
                 res.writeHead(400, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Unsupported URL. Only Vavoo URLs are supported.' }));
                 return;
             }
-            if (!isAllowedVavooUrl(targetUrl, allowedSet)) {
+            if (!isAllowedVavooUrl(targetUrl)) {
                 res.writeHead(403, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'This Vavoo channel is not authorized on this worker.' }));
                 return;
             }
+
+            const clientIP = getClientIP(req);
+            if (clientIP && clientIP.includes(':')) {
+                res.writeHead(403, CORS_HEADERS);
+                res.end('IPv6 connections are not allowed for this service. Please disable IPv6.');
+                return;
+            }
+
+            const startTime = Date.now();
             const extractor = new VavooExtractor();
-            await extractor.handle(targetUrl, req, res, allowedSet);
+
+            let streamUrl;
+            try {
+                streamUrl = await extractor.resolveStream(targetUrl, clientIP);
+            } catch (e) {
+                console.error(`Initial resolve failed: ${e.message}`);
+                res.writeHead(502, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Failed to resolve stream.', detail: e.message }));
+                return;
+            }
+
+            const elapsed = Date.now() - startTime;
+            if (elapsed > SLOW_REQUEST_THRESHOLD_MS) {
+                console.warn(`Slow manifest request: ${elapsed}ms for ${targetUrl}`);
+            }
+
+            await proxyHls(req, res, streamUrl, targetUrl, extractor, clientIP);
             return;
         }
 
-        if (url.pathname === '/proxy/hls/manifest.m3u8') {
+        // ---- /proxy/hls/raw → media playlist & segment proxy
+        if (url.pathname === '/proxy/hls/raw') {
             const targetUrl = url.searchParams.get('d');
+            const vavooUrl = url.searchParams.get('v');
+
             if (!targetUrl) {
                 res.writeHead(400, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Missing "d" parameter' }));
                 return;
             }
-            if (!isVavooHost(targetUrl)) {
-                res.writeHead(400, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Unsupported URL. Only Vavoo URLs are supported in parameter "d".' }));
-                return;
-            }
-            if (!isAllowedVavooUrl(targetUrl, allowedSet)) {
-                res.writeHead(403, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'This Vavoo channel is not authorized on this worker.' }));
-                return;
-            }
+
+            const clientIP = getClientIP(req);
             const extractor = new VavooExtractor();
-            await extractor.handle(targetUrl, req, res, allowedSet);
+            await proxyHls(req, res, targetUrl, vavooUrl, extractor, clientIP);
             return;
         }
 
@@ -729,12 +918,16 @@ const server = http.createServer(async (req, res) => {
 
     } catch (error) {
         console.error(`Node.js Error: ${error.stack || error.message}`);
-        res.writeHead(500, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: error.message, type: error.name }));
+        if (!res.headersSent) {
+            res.writeHead(500, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: error.message, type: error.name }));
+        } else {
+            try { res.destroy(); } catch {}
+        }
     }
 });
 
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
-    console.log(`Vavoo Extractor listening on port ${PORT}`);
+    console.log(`Vavoo Extractor v2.0 listening on port ${PORT}`);
 });
