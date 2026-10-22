@@ -114,7 +114,7 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
 '17854799144cbb1c340ac1', // special box belgesel
 '3856957052050da882aa10', // tarih tv
 '1960546091bcaf052d3800', //nat geo
-'1519237116daf8e783a22b', //NAT WİLD
+'1324166169d75d5197aa7', //NAT WİLD
 '4017734592f45fd8456678', //discovery
    //ÇOCUK
    '11743931b356e8661a4d', // Cartonito
