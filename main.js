@@ -116,6 +116,7 @@ const DEFAULT_ALLOWED_CHANNEL_IDS = [
 '1960546091bcaf052d3800', //nat geo
 '1324166169d75d5197aa7', //NAT WİLD
 '4017734592f45fd8456678', //discovery
+'870320507489feac51e9a', //köy tv
    //ÇOCUK
    '11743931b356e8661a4d', // Cartonito
    '2046583925cdbd476d8733', //Anigo Zorex
